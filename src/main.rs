@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_recursion::async_recursion;
 use clap::Parser;
 use dashmap::DashMap;
@@ -39,6 +39,9 @@ struct Args {
 static PING_CACHE: Lazy<DashMap<String, bool>> = Lazy::new(DashMap::new);
 
 fn read_dns_from_file(path: &str) -> Result<Vec<String>> {
+    if !File::open(path).is_ok() {
+        return Ok(vec![]);
+    }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     Ok(reader
@@ -72,24 +75,44 @@ async fn ping_with_cache(ip: &str) -> bool {
     res
 }
 
-async fn nslookup(domain: &str, dns_ip: &str) -> Result<IpAddr, ()> {
-    let dns_ip = dns_ip.parse::<IpAddr>().map_err(|_| ())?;
-    let ns_config = NameServerConfigGroup::from_ips_clear(&[dns_ip], 53, true);
+async fn nslookup(domain: &str, dns_ip: &str, preset: NameServerConfigGroup) -> Result<IpAddr, ()> {
+    let ns_config: NameServerConfigGroup;
+    let dns_name;
+    if dns_ip == "" {
+        ns_config = preset.clone();
+        dns_name = preset
+            .iter()
+            .next()
+            .unwrap()
+            .tls_dns_name
+            .clone()
+            .unwrap_or_default();
+    } else {
+        let dns_ip_addr = dns_ip.parse::<IpAddr>().map_err(|_| ())?;
+        dns_name = dns_ip.to_string();
+        ns_config = NameServerConfigGroup::from_ips_clear(&[dns_ip_addr], 53, true);
+    }
     let resolver_config = ResolverConfig::from_parts(None, vec![], ns_config);
     let resolver =
         Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default()).build();
-    let response = resolver
-        .lookup_ip(domain)
-        .await
-        .context("failed to lookup ip")
-        .map_err(|_| ())?;
-    for address in response.iter() {
-        println!("{} {}   [dns:{}]", domain, address, dns_ip);
-        if address.to_string() == "127.0.0.1" {
-            continue;
+    match resolver.lookup_ip(domain).await {
+        Ok(response) => {
+            for address in response.iter() {
+                println!("{} {}   [dns:{}]", domain, address, dns_name);
+                if address.to_string() == "127.0.0.1" {
+                    continue;
+                }
+                if address.to_string().starts_with("192.168") {
+                    continue;
+                }
+                if ping_with_cache(address.to_string().as_str()).await {
+                    return Ok(address);
+                }
+            }
         }
-        if ping_with_cache(address.to_string().as_str()).await {
-            return Ok(address);
+        Err(e) => {
+            eprintln!("dns {} 查询失败: {}", dns_name, e);
+            return Err(());
         }
     }
     Err(())
@@ -97,16 +120,24 @@ async fn nslookup(domain: &str, dns_ip: &str) -> Result<IpAddr, ()> {
 
 async fn any_nslookup(domain: &str, servers: &Vec<String>) -> Result<IpAddr, ()> {
     use futures::future::select_ok;
-    let futures: Vec<Pin<Box<dyn Future<Output = Result<IpAddr, ()>> + Send>>> = servers
+    let mut futures: Vec<Pin<Box<dyn Future<Output = Result<IpAddr, ()>> + Send>>> = servers
         .iter()
         .map(|dns| {
             // 先是 Pin<Box<impl Future...>>
-            let fut = nslookup(&domain, &dns);
+            let fut = nslookup(&domain, &dns, NameServerConfigGroup::default());
             // 明确转换成 Trait Object
             Pin::from(Box::new(fut) as Box<dyn Future<Output = Result<IpAddr, ()>> + Send>)
         })
         .collect();
 
+    let name_server_config_group_list = [
+        NameServerConfigGroup::quad9_https(),
+        NameServerConfigGroup::cloudflare_https(),
+    ];
+    for preset in name_server_config_group_list {
+        futures.push(Pin::from(Box::new(nslookup(&domain, "", preset))
+            as Box<dyn Future<Output = Result<IpAddr, ()>> + Send>));
+    }
     let (ok_ip, _) = select_ok(futures).await?;
     Ok(ok_ip)
 }
@@ -228,7 +259,13 @@ fn strip_url(s: String) -> String {
         .or_else(|| s.strip_prefix("//"))
         .unwrap_or(s.as_str())
         .trim();
-    s.split('/').next().unwrap_or(s).to_string()
+    let s = s.split('/').next().unwrap_or(s);
+    let s = s.split('?').next().unwrap_or(s);
+    if !s.contains('.') {
+        // 无效 url
+        return "".to_string();
+    }
+    s.to_string()
 }
 
 async fn url_in_web(web: &str) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
