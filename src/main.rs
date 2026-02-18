@@ -67,7 +67,7 @@ async fn ping_with_cache(ip: &str) -> bool {
     // 先占用，防止重复ping
     PING_CACHE.insert(ip.to_string(), false);
     let res = ping(ip).await;
-    PING_CACHE.entry(ip.to_string()).and_modify(|v| *v = true);
+    PING_CACHE.entry(ip.to_string()).and_modify(|v| *v = res);
     println!("{:12} ping{}通", ip, if res { "" } else { "不" });
     res
 }
