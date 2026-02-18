@@ -3,8 +3,15 @@ name = "IpLookup"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+opt-level = "z" # 优化代码尺寸
+lto = true # 启用链接时优化 (Link Time Optimization)
+codegen-units = 1 # 降低代码生成单元数，增加优化时间但减少二进制大小
+panic = "abort" # 使用 'abort' 而不是 'unwind' 来处理 panic
+strip = "debuginfo" # 移除调试信息
+
 [dependencies]
-hickory-resolver = "0.25"
+hickory-resolver = { version = "0.25.2", features = ["https-ring"] }
 tokio = { version = "1", features = ["process", "macros", "rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
